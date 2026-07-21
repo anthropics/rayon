@@ -796,7 +796,7 @@ impl WorkerThread {
             let mut idle_state = self.registry.sleep.start_looking(self.index);
             while !latch.probe() {
                 if let Some(job) = self.find_work() {
-                    self.registry.sleep.work_found();
+                    self.registry.sleep.work_found(&mut idle_state);
                     self.execute(job);
                     // The job might have injected local work, so go back to the outer loop.
                     continue 'outer;
@@ -809,7 +809,7 @@ impl WorkerThread {
 
             // If we were sleepy, we are not anymore. We "found work" --
             // whatever the surrounding thread was doing before it had to wait.
-            self.registry.sleep.work_found();
+            self.registry.sleep.work_found(&mut idle_state);
             break;
         }
 

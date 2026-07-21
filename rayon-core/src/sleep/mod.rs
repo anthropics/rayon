@@ -4,7 +4,8 @@
 use crate::latch::CoreLatch;
 use crate::sync::{Condvar, Mutex};
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 
 mod counters;
@@ -24,6 +25,31 @@ pub(super) struct Sleep {
     worker_sleep_states: Vec<CachePadded<WorkerSleepState>>,
 
     counters: AtomicCounters,
+
+    /// Number of idle workers currently running the full yield/steal spin
+    /// rounds. Only maintained when `RAYON_MAX_SEARCHERS` is set; workers
+    /// beyond the bound skip straight to the sleepy protocol (announce via
+    /// the JEC, one final search, then block) instead of spinning, which
+    /// keeps the idle steal traffic O(bound) instead of O(pool width).
+    /// The bound applies per pool (per `Sleep` instance), not per process.
+    searchers: AtomicUsize,
+
+    /// Copy of [`max_searchers`], resolved at pool construction so the
+    /// hot paths read a plain field instead of the `OnceLock`.
+    max_searchers: usize,
+}
+
+/// Bound on concurrently spinning idle workers, from `RAYON_MAX_SEARCHERS`.
+/// `usize::MAX` (unset/invalid) preserves stock behavior exactly.
+fn max_searchers() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("RAYON_MAX_SEARCHERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(usize::MAX)
+    })
 }
 
 /// An instance of this struct is created when a thread becomes idle.
@@ -41,6 +67,11 @@ pub(super) struct IdleState {
     /// Once we become sleepy, what was the sleepy counter value?
     /// Set to `INVALID_SLEEPY_COUNTER` otherwise.
     jobs_counter: JobsEventCounter,
+
+    /// Whether this idle thread holds one of the bounded searcher slots
+    /// (always true when `RAYON_MAX_SEARCHERS` is unset — the counter is
+    /// not maintained in that mode).
+    is_searcher: bool,
 }
 
 /// The "sleep state" for an individual worker.
@@ -62,22 +93,55 @@ impl Sleep {
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
             counters: AtomicCounters::new(),
+            searchers: AtomicUsize::new(0),
+            max_searchers: max_searchers(),
         }
+    }
+
+    /// Try to take one of the bounded searcher slots. Always succeeds (and
+    /// touches no shared state) when the bound is disabled.
+    #[inline]
+    fn try_acquire_searcher(&self) -> bool {
+        let max = self.max_searchers;
+        if max == usize::MAX {
+            return true;
+        }
+        self.searchers
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    #[inline]
+    fn release_searcher(&self, idle_state: &mut IdleState) {
+        if idle_state.is_searcher && self.max_searchers != usize::MAX {
+            self.searchers.fetch_sub(1, Ordering::Relaxed);
+        }
+        idle_state.is_searcher = false;
     }
 
     #[inline]
     pub(super) fn start_looking(&self, worker_index: usize) -> IdleState {
         self.counters.add_inactive_thread();
 
+        let is_searcher = self.try_acquire_searcher();
         IdleState {
             worker_index,
-            rounds: 0,
+            // Non-searchers skip the yield/steal spin rounds and enter the
+            // sleepy protocol directly: announce via the JEC, one final
+            // search, then block. This is the stock protocol from round
+            // ROUNDS_UNTIL_SLEEPY on, so the no-lost-wakeup reasoning is
+            // unchanged.
+            rounds: if is_searcher { 0 } else { ROUNDS_UNTIL_SLEEPY },
             jobs_counter: JobsEventCounter::DUMMY,
+            is_searcher,
         }
     }
 
     #[inline]
-    pub(super) fn work_found(&self) {
+    pub(super) fn work_found(&self, idle_state: &mut IdleState) {
+        self.release_searcher(idle_state);
         // If we were the last idle thread and other threads are still sleeping,
         // then we should wake up another thread.
         let threads_to_wake = self.counters.sub_inactive_thread();
@@ -135,6 +199,17 @@ impl Sleep {
         // will have some stuff to do.
         if !latch.fall_asleep() {
             idle_state.wake_fully();
+            // `fall_asleep` failing implies the latch is SET, so the caller's
+            // probe loop exits before this spin budget is spent — but gate it
+            // on a slot anyway so the searcher bound never depends on that
+            // latch invariant. A holder keeps its slot; only non-holders try
+            // to acquire (overwriting a held slot here would leak it).
+            if !idle_state.is_searcher {
+                idle_state.is_searcher = self.try_acquire_searcher();
+            }
+            if !idle_state.is_searcher {
+                idle_state.rounds = ROUNDS_UNTIL_SLEEPY;
+            }
             return;
         }
 
@@ -160,6 +235,10 @@ impl Sleep {
         }
 
         // Successfully registered as asleep.
+
+        // Committed to blocking: give up the searcher slot so another idle
+        // worker may spin in our place.
+        self.release_searcher(idle_state);
 
         // We have one last check for injected jobs to do. This protects against
         // deadlock in the very unlikely event that
@@ -190,6 +269,12 @@ impl Sleep {
 
         // Update other state:
         idle_state.wake_fully();
+        // `wake_fully` grants a fresh spin budget; under the searcher bound
+        // that budget requires a slot, otherwise re-enter as a non-searcher.
+        idle_state.is_searcher = self.try_acquire_searcher();
+        if !idle_state.is_searcher {
+            idle_state.rounds = ROUNDS_UNTIL_SLEEPY;
+        }
         latch.wake_up();
     }
 

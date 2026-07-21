@@ -1,6 +1,6 @@
 [package]
 name = "rayon-core"
-version = "1.13.0"
+version = "1.13.1000+anthropic"
 description = "Core APIs for Rayon"
 documentation = "https://docs.rs/rayon-core/"
 links = "rayon-core"
