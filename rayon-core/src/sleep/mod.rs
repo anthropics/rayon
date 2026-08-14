@@ -27,21 +27,21 @@ pub(super) struct Sleep {
     counters: AtomicCounters,
 
     /// Number of idle workers currently running the full yield/steal spin
-    /// rounds. Only maintained when `RAYON_MAX_SEARCHERS` is set; workers
+    /// rounds. Only maintained when the pool has a searcher bound; workers
     /// beyond the bound skip straight to the sleepy protocol (announce via
     /// the JEC, one final search, then block) instead of spinning, which
     /// keeps the idle steal traffic O(bound) instead of O(pool width).
     /// The bound applies per pool (per `Sleep` instance), not per process.
     searchers: AtomicUsize,
 
-    /// Copy of [`max_searchers`], resolved at pool construction so the
-    /// hot paths read a plain field instead of the `OnceLock`.
+    /// This pool's searcher bound; `usize::MAX` means unbounded.
     max_searchers: usize,
 }
 
-/// Bound on concurrently spinning idle workers, from `RAYON_MAX_SEARCHERS`.
-/// `usize::MAX` (unset/invalid) preserves stock behavior exactly.
-fn max_searchers() -> usize {
+/// Default bound on concurrently spinning idle workers, from
+/// `RAYON_MAX_SEARCHERS`. `usize::MAX` (unset/invalid) preserves stock
+/// behavior exactly.
+pub(super) fn max_searchers_from_env() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
         std::env::var("RAYON_MAX_SEARCHERS")
@@ -69,7 +69,7 @@ pub(super) struct IdleState {
     jobs_counter: JobsEventCounter,
 
     /// Whether this idle thread holds one of the bounded searcher slots
-    /// (always true when `RAYON_MAX_SEARCHERS` is unset — the counter is
+    /// (always true when the pool has no searcher bound — the counter is
     /// not maintained in that mode).
     is_searcher: bool,
 }
@@ -88,13 +88,13 @@ const ROUNDS_UNTIL_SLEEPY: u32 = 32;
 const ROUNDS_UNTIL_SLEEPING: u32 = ROUNDS_UNTIL_SLEEPY + 1;
 
 impl Sleep {
-    pub(super) fn new(n_threads: usize) -> Sleep {
+    pub(super) fn new(n_threads: usize, max_searchers: usize) -> Sleep {
         assert!(n_threads <= THREADS_MAX);
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
             counters: AtomicCounters::new(),
             searchers: AtomicUsize::new(0),
-            max_searchers: max_searchers(),
+            max_searchers,
         }
     }
 

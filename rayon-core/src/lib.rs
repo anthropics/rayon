@@ -199,6 +199,11 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
     breadth_first: bool,
+
+    /// Bound on how many idle workers may spin searching for work at once.
+    /// If zero will use the RAYON_MAX_SEARCHERS environment variable.
+    /// If RAYON_MAX_SEARCHERS is invalid or zero there is no bound.
+    max_searchers: usize,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -235,6 +240,7 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
+            max_searchers: 0,
         }
     }
 }
@@ -445,6 +451,7 @@ impl<S> ThreadPoolBuilder<S> {
             start_handler: self.start_handler,
             exit_handler: self.exit_handler,
             breadth_first: self.breadth_first,
+            max_searchers: self.max_searchers,
         }
     }
 
@@ -624,6 +631,33 @@ impl<S> ThreadPoolBuilder<S> {
         self.breadth_first
     }
 
+    /// Sets how many of this pool's idle worker threads may spin searching
+    /// for work (rounds of `thread::yield_now` plus a steal sweep over every
+    /// deque) at the same time; idle workers beyond the bound block until
+    /// woken instead of spinning. With no bound every idle worker spins, so
+    /// a wide pool that is mostly idle burns CPU roughly quadratic in its
+    /// width.
+    ///
+    /// If `max_searchers` is 0, or you do not call this function, the bound
+    /// comes from the `RAYON_MAX_SEARCHERS` environment variable; if that
+    /// is unset, invalid or zero there is no bound (stock behavior).
+    /// `usize::MAX` means no bound for this pool whatever the environment
+    /// variable says.
+    pub fn max_searchers(mut self, max_searchers: usize) -> Self {
+        self.max_searchers = max_searchers;
+        self
+    }
+
+    /// Get the searcher bound for the thread pool: `usize::MAX` when
+    /// unbounded. See `max_searchers()` for more information.
+    fn get_max_searchers(&self) -> usize {
+        if self.max_searchers > 0 {
+            self.max_searchers
+        } else {
+            sleep::max_searchers_from_env()
+        }
+    }
+
     /// Takes the current thread start callback, leaving `None`.
     fn take_start_handler(&mut self) -> Option<Box<StartHandler>> {
         self.start_handler.take()
@@ -800,6 +834,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             spawn_handler: _,
             ref breadth_first,
+            ref max_searchers,
         } = *self;
 
         // Just print `Some(<closure>)` or `None` to the debug
@@ -824,6 +859,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("start_handler", &start_handler)
             .field("exit_handler", &exit_handler)
             .field("breadth_first", &breadth_first)
+            .field("max_searchers", &max_searchers)
             .finish()
     }
 }

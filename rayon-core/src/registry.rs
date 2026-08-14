@@ -246,6 +246,7 @@ impl Registry {
         let n_threads = Ord::min(builder.get_num_threads(), crate::max_num_threads());
 
         let breadth_first = builder.get_breadth_first();
+        let max_searchers = builder.get_max_searchers();
 
         let (workers, stealers): (Vec<_>, Vec<_>) = (0..n_threads)
             .map(|_| {
@@ -270,7 +271,7 @@ impl Registry {
 
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
-            sleep: Sleep::new(n_threads),
+            sleep: Sleep::new(n_threads, max_searchers),
             injected_jobs: Injector::new(),
             broadcasts: Mutex::new(broadcasts),
             terminate_count: AtomicUsize::new(1),
