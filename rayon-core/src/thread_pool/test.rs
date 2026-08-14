@@ -416,3 +416,32 @@ fn yield_local_to_spawn() {
     // for it to finish if a different thread stole it first.
     assert_eq!(22, rx.recv().unwrap());
 }
+
+#[test]
+fn builder_max_searchers_pool_works() {
+    // A pool bounded via the builder (not the env var) must produce the
+    // same results as an unbounded one across repeated idle/busy
+    // transitions, exercising the searcher-slot paths per wake/sleep
+    // cycle. usize::MAX must force the unbounded fast path.
+    for bound in [1, usize::MAX] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(8)
+            .max_searchers(bound)
+            .build()
+            .unwrap();
+        for _ in 0..50 {
+            let sum = pool.install(|| {
+                crate::scope(|s| {
+                    let (tx, rx) = channel();
+                    for i in 0..64 {
+                        let tx = tx.clone();
+                        s.spawn(move |_| tx.send(i).unwrap());
+                    }
+                    drop(tx);
+                    rx.iter().sum::<i32>()
+                })
+            });
+            assert_eq!(sum, (0..64).sum::<i32>());
+        }
+    }
+}
