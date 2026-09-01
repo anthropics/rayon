@@ -1,0 +1,78 @@
+# Adapted from anthropics/tokio anthropic-1.52.3 publish.yml (go/fork,
+# go/artifactory-publish).
+# Security notes:
+# - GitHub-owned actions use tag pins, third-party actions use SHA pins
+# - Only two external actions: actions/checkout (GitHub-owned) and
+#   jfrog/setup-jfrog-cli (allowlisted, handles OIDC auth)
+# - Rust toolchain uses the runner's pre-installed rustup
+# - Publishing runs from the anthropic-1.13.3000 release branch
+name: Publish to Artifactory
+
+on:
+  push:
+    branches:
+      - anthropic-1.13.3000
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # Publishing must never ship an untested build: this is the only workflow
+  # that runs on pushes to the release branch, so it carries its own gate.
+  # This line carries upstream rayon-rs/rayon#1314 (adaptive idle spinning
+  # by default, plus the bounded_searchers()/unbounded_searchers() builder
+  # policies); the rayon-core suite exercises all three policies.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+
+      - name: Test rayon-core
+        run: cargo test -p rayon-core
+
+      - name: Test rayon against patched core
+        run: cargo test -p rayon --release
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: publish
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: |
+          rustup default stable
+          rustup show
+
+      - name: Setup JFrog CLI
+        id: setup-jfrog
+        uses: jfrog/setup-jfrog-cli@ff5cb544114ffc152db9cea1cd3d5978d5074946  # v4.5.11
+        env:
+          JF_URL: https://artifactory.infra.ant.dev
+        with:
+          oidc-provider-name: github
+          oidc-audience: jfrog-github
+
+      - name: Configure Cargo Registry
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [registries.crates-internal]
+          index = "sparse+https://artifactory.infra.ant.dev/artifactory/api/cargo/crates-internal/index/"
+          credential-provider = ["cargo:token"]
+          EOF
+
+      - name: Publish rayon-core to Artifactory
+        env:
+          CARGO_REGISTRIES_CRATES_INTERNAL_TOKEN: "Bearer ${{ steps.setup-jfrog.outputs.oidc-token }}"
+        run: |
+          cd rayon-core
+          cargo publish --registry crates-internal --allow-dirty
