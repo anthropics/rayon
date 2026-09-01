@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   # Publishing must never ship an untested build: this is the only workflow
@@ -44,6 +43,9 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: publish
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
