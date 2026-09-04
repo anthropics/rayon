@@ -1,6 +1,6 @@
 use crate::job::{JobFifo, JobRef, StackJob};
 use crate::latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch, SpinLatch};
-use crate::sleep::Sleep;
+use crate::sleep::{IdleState, Sleep, Verdict};
 use crate::sync::Mutex;
 use crate::unwind;
 use crate::{
@@ -605,6 +605,13 @@ impl Registry {
     pub(super) fn notify_worker_latch_is_set(&self, target_worker_index: usize) {
         self.sleep.notify_worker_latch_is_set(target_worker_index);
     }
+
+    /// Adaptive spin: how many workers are idle at the top of their loop
+    /// (maintained under the adaptive policy only).
+    #[cfg(test)]
+    pub(crate) fn top_level_idle_workers(&self) -> usize {
+        self.sleep.idle_workers()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -646,6 +653,11 @@ impl ThreadInfo {
 // ////////////////////////////////////////////////////////////////////////
 // WorkerThread identifiers
 
+/// Adaptive spin: consecutive wasted spin windows before a worker stops
+/// spinning in that situation. One is the normal end of a burst of work
+/// (its last window is always wasted), so two are required.
+const MISSES_TO_STOP: u8 = 2;
+
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
     worker: Worker<JobRef>,
@@ -653,14 +665,25 @@ pub(super) struct WorkerThread {
     /// the "stealer" half of the worker's broadcast deque
     stealer: Stealer<JobRef>,
 
-    /// Adaptive spin: whether this worker's next idle episode gets the
-    /// yield/steal spin rounds. Set from how the previous episode ended --
-    /// work found before sleeping re-arms spinning, an episode that had to
-    /// block disarms it. Under load searches succeed and every worker
-    /// spins (the historical behavior); in idle or periodic workloads
-    /// spinning self-extinguishes, and re-arms as soon as a search finds
-    /// work again. Purely worker-local: no shared state.
-    spin_next: Cell<bool>,
+    /// Adaptive spin: whether this worker keeps spinning once the pool is
+    /// fully idle (no parallel region in progress). Only a newly injected
+    /// job can end such a wait, so spinning through it pays off only if
+    /// such jobs tend to arrive within a spin window. Learned from the
+    /// worker's own idle episodes: a gap bridged by spinning, or a sleep
+    /// shorter than a window, turns it on; two consecutive windows spun
+    /// through an idle pool for nothing turn it off. A worker with this
+    /// on also spins whenever a region is in progress: it expects more
+    /// work within a window either way.
+    spin_through_idle: Cell<bool>,
+
+    /// Adaptive spin: consecutive spin windows wasted on an idle pool.
+    idle_misses: Cell<u8>,
+
+    /// Adaptive spin: whether this worker spins while a region is in
+    /// progress even though it expects long idle gaps: true after an
+    /// idle episode that found work without sleeping (work is flowing
+    /// to this worker), false after one that had to sleep for it.
+    spin_while_active: Cell<bool>,
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -689,7 +712,9 @@ impl From<ThreadBuilder> for WorkerThread {
             stealer: thread.stealer,
             fifo: JobFifo::new(),
             index: thread.index,
-            spin_next: Cell::new(true),
+            spin_through_idle: Cell::new(true),
+            idle_misses: Cell::new(0),
+            spin_while_active: Cell::new(true),
             rng: XorShift64Star::new(),
             registry: thread.registry,
         }
@@ -784,12 +809,49 @@ impl WorkerThread {
     pub(super) unsafe fn wait_until<L: AsCoreLatch + ?Sized>(&self, latch: &L) {
         let latch = latch.as_core_latch();
         if !latch.probe() {
-            unsafe { self.wait_until_cold(latch) };
+            unsafe { self.wait_until_cold(latch, false) };
         }
     }
 
+    /// Adaptive spin: fold what an idle episode showed into this worker's
+    /// memory for the next one.
+    #[inline]
+    fn adapt_spin(&self, idle_state: &IdleState) {
+        Self::learn(
+            idle_state.idle_gap(),
+            &self.spin_through_idle,
+            &self.idle_misses,
+        );
+        self.spin_while_active.set(idle_state.found_awake());
+    }
+
+    /// Adaptive spin: fold one verdict into a learned bit. One miss is
+    /// the normal end of a burst of work (its last window is always
+    /// wasted), so it takes two in a row to turn spinning off, and one
+    /// hit to turn it back on.
+    #[inline]
+    fn learn(verdict: Verdict, spin: &Cell<bool>, misses: &Cell<u8>) {
+        match verdict {
+            Verdict::Hit => {
+                misses.set(0);
+                spin.set(true);
+            }
+            Verdict::Miss => {
+                let n = misses.get().saturating_add(1);
+                misses.set(n);
+                if n >= MISSES_TO_STOP {
+                    spin.set(false);
+                }
+            }
+            Verdict::Unknown => {}
+        }
+    }
+
+    /// `top_level` says the wait is the worker's main loop (idle with
+    /// nothing in flight), as opposed to a `join` waiting for a stolen
+    /// job while a parallel region is still in progress.
     #[cold]
-    unsafe fn wait_until_cold(&self, latch: &CoreLatch) {
+    unsafe fn wait_until_cold(&self, latch: &CoreLatch, top_level: bool) {
         // the code below should swallow all panics and hence never
         // unwind; but if something does wrong, we want to abort,
         // because otherwise other code in rayon may assume that the
@@ -805,14 +867,16 @@ impl WorkerThread {
                 continue;
             }
 
-            let mut idle_state = self
-                .registry
-                .sleep
-                .start_looking(self.index, self.spin_next.get());
+            let mut idle_state = self.registry.sleep.start_looking(
+                self.index,
+                top_level,
+                self.spin_through_idle.get(),
+                self.spin_while_active.get(),
+            );
             while !latch.probe() {
                 if let Some(job) = self.find_work() {
                     self.registry.sleep.work_found(&mut idle_state);
-                    self.spin_next.set(!idle_state.slept);
+                    self.adapt_spin(&idle_state);
                     unsafe { self.execute(job) };
                     // The job might have injected local work, so go back to the outer loop.
                     continue 'outer;
@@ -826,7 +890,7 @@ impl WorkerThread {
             // If we were sleepy, we are not anymore. We "found work" --
             // whatever the surrounding thread was doing before it had to wait.
             self.registry.sleep.work_found(&mut idle_state);
-            self.spin_next.set(!idle_state.slept);
+            self.adapt_spin(&idle_state);
             break;
         }
 
@@ -839,7 +903,10 @@ impl WorkerThread {
             let registry = &*self.registry;
             let index = self.index;
 
-            self.wait_until(&registry.thread_infos[index].terminate);
+            let terminate = registry.thread_infos[index].terminate.as_core_latch();
+            if !terminate.probe() {
+                self.wait_until_cold(terminate, true);
+            }
 
             // Should not be any work left in our queue.
             debug_assert!(self.take_local_job().is_none());

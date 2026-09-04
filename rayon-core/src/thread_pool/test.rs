@@ -447,3 +447,67 @@ fn spin_policy_pools_work() {
         }
     }
 }
+
+#[test]
+fn spin_policies_tick_shaped_workload() {
+    // A control loop's shape: several short parallel regions back to
+    // back with sequential work between them, then an idle gap before the
+    // next tick. This walks the adaptive policy through every transition
+    // it learns from (spinning through a short gap, stopping at a long
+    // one, waking from both) and must stay live and correct under all
+    // three policies.
+    fn region(n: u64) -> u64 {
+        if n <= 1 {
+            // A few microseconds of work per leaf.
+            let mut x = n;
+            for _ in 0..200 {
+                x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+            }
+            std::hint::black_box(x);
+            n
+        } else {
+            let (a, b) = crate::join(|| region(n / 2), || region(n - n / 2));
+            a + b
+        }
+    }
+    fn busy(us: u64) {
+        let end = std::time::Instant::now() + std::time::Duration::from_micros(us);
+        while std::time::Instant::now() < end {
+            std::hint::spin_loop();
+        }
+    }
+    let builders = [
+        ThreadPoolBuilder::new().num_threads(8),
+        ThreadPoolBuilder::new().num_threads(8).bounded_searchers(),
+        ThreadPoolBuilder::new()
+            .num_threads(8)
+            .unbounded_searchers(),
+    ];
+    for (i, builder) in builders.into_iter().enumerate() {
+        let pool = builder.build().unwrap();
+        for _tick in 0..40 {
+            for r in 0..8 {
+                if r > 0 {
+                    busy(20);
+                }
+                assert_eq!(pool.install(|| region(64)), 64);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if i == 0 {
+            // The adaptive policy's idle accounting must settle back to
+            // "every worker idle at the top of its loop" once the pool
+            // has nothing to do, or a later region would be misjudged as
+            // still in progress (or a region as idle).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pool.registry.top_level_idle_workers() != 8 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pool never settled to fully idle: {} of 8 workers idle",
+                    pool.registry.top_level_idle_workers()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
