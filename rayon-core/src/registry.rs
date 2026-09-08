@@ -653,10 +653,77 @@ impl ThreadInfo {
 // ////////////////////////////////////////////////////////////////////////
 // WorkerThread identifiers
 
-/// Adaptive spin: consecutive wasted spin windows before a worker stops
-/// spinning in that situation. One is the normal end of a burst of work
-/// (its last window is always wasted), so two are required.
-const MISSES_TO_STOP: u8 = 2;
+/// Adaptive spin: one thing a worker learns about its pool -- whether
+/// spinning in some situation (through an idle pool; a full window with
+/// a region in progress) finds work. A window that finds work turns it
+/// on. Consecutive wasted windows turn it off; one is the normal end of a
+/// burst of work (its last window is always wasted) and a window that is
+/// about as long as the gaps it bridges misses now and then, so it takes
+/// three.
+/// While off, the worker sleeps early instead, and a sleep cut short by
+/// work arriving is the only sign spinning might pay again -- but not
+/// proof, since another worker may have taken the work; so such sleeps
+/// earn a probe window, with exponential backoff in the number of short
+/// sleeps required while the probes keep coming up empty. A worker that
+/// is one of too many for its pool's parallelism thus spins ever more
+/// rarely; one whose pool merely paused briefly re-arms on its first
+/// probe.
+struct Learned {
+    on: Cell<bool>,
+    /// Consecutive wasted windows.
+    misses: Cell<u8>,
+    /// Short sleeps since the last probe.
+    shorts: Cell<u8>,
+}
+
+impl Learned {
+    const MISSES_TO_STOP: u8 = 3;
+    const MAX_BACKOFF_SHIFT: u8 = 6;
+
+    fn new() -> Self {
+        Learned {
+            on: Cell::new(true),
+            misses: Cell::new(0),
+            shorts: Cell::new(0),
+        }
+    }
+
+    fn get(&self) -> bool {
+        self.on.get()
+    }
+
+    fn learn(&self, verdict: Verdict) {
+        match verdict {
+            Verdict::Hit => {
+                self.misses.set(0);
+                self.shorts.set(0);
+                self.on.set(true);
+            }
+            Verdict::Miss => {
+                let n = self.misses.get().saturating_add(1);
+                self.misses.set(n);
+                if n >= Self::MISSES_TO_STOP {
+                    self.on.set(false);
+                }
+            }
+            Verdict::Short => {
+                if !self.on.get() {
+                    let shorts = self.shorts.get().saturating_add(1);
+                    let shift = (self.misses.get().saturating_sub(Self::MISSES_TO_STOP))
+                        .min(Self::MAX_BACKOFF_SHIFT);
+                    if shorts >= 1 << shift {
+                        // Probe: one window; a hit re-arms, a miss backs off.
+                        self.shorts.set(0);
+                        self.on.set(true);
+                    } else {
+                        self.shorts.set(shorts);
+                    }
+                }
+            }
+            Verdict::Unknown => {}
+        }
+    }
+}
 
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
@@ -668,22 +735,17 @@ pub(super) struct WorkerThread {
     /// Adaptive spin: whether this worker keeps spinning once the pool is
     /// fully idle (no parallel region in progress). Only a newly injected
     /// job can end such a wait, so spinning through it pays off only if
-    /// such jobs tend to arrive within a spin window. Learned from the
-    /// worker's own idle episodes: a gap bridged by spinning, or a sleep
-    /// shorter than a window, turns it on; two consecutive windows spun
-    /// through an idle pool for nothing turn it off. A worker with this
+    /// such jobs tend to arrive within a spin window. A worker with this
     /// on also spins whenever a region is in progress: it expects more
     /// work within a window either way.
-    spin_through_idle: Cell<bool>,
+    spin_through_idle: Learned,
 
-    /// Adaptive spin: consecutive spin windows wasted on an idle pool.
-    idle_misses: Cell<u8>,
-
-    /// Adaptive spin: whether this worker spins while a region is in
-    /// progress even though it expects long idle gaps: true after an
-    /// idle episode that found work without sleeping (work is flowing
-    /// to this worker), false after one that had to sleep for it.
-    spin_while_active: Cell<bool>,
+    /// Adaptive spin: whether this worker spins a full window while a
+    /// region is in progress, beyond the few rounds always allowed. A
+    /// region's serial stretches (its installing worker running alone
+    /// between bursts of parallel work) are bridged by spinning only
+    /// when shorter than a window.
+    spin_full_active: Learned,
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -712,9 +774,8 @@ impl From<ThreadBuilder> for WorkerThread {
             stealer: thread.stealer,
             fifo: JobFifo::new(),
             index: thread.index,
-            spin_through_idle: Cell::new(true),
-            idle_misses: Cell::new(0),
-            spin_while_active: Cell::new(true),
+            spin_through_idle: Learned::new(),
+            spin_full_active: Learned::new(),
             rng: XorShift64Star::new(),
             registry: thread.registry,
         }
@@ -817,34 +878,8 @@ impl WorkerThread {
     /// memory for the next one.
     #[inline]
     fn adapt_spin(&self, idle_state: &IdleState) {
-        Self::learn(
-            idle_state.idle_gap(),
-            &self.spin_through_idle,
-            &self.idle_misses,
-        );
-        self.spin_while_active.set(idle_state.found_awake());
-    }
-
-    /// Adaptive spin: fold one verdict into a learned bit. One miss is
-    /// the normal end of a burst of work (its last window is always
-    /// wasted), so it takes two in a row to turn spinning off, and one
-    /// hit to turn it back on.
-    #[inline]
-    fn learn(verdict: Verdict, spin: &Cell<bool>, misses: &Cell<u8>) {
-        match verdict {
-            Verdict::Hit => {
-                misses.set(0);
-                spin.set(true);
-            }
-            Verdict::Miss => {
-                let n = misses.get().saturating_add(1);
-                misses.set(n);
-                if n >= MISSES_TO_STOP {
-                    spin.set(false);
-                }
-            }
-            Verdict::Unknown => {}
-        }
+        self.spin_through_idle.learn(idle_state.idle_gap());
+        self.spin_full_active.learn(idle_state.active_window());
     }
 
     /// `top_level` says the wait is the worker's main loop (idle with
@@ -871,7 +906,7 @@ impl WorkerThread {
                 self.index,
                 top_level,
                 self.spin_through_idle.get(),
-                self.spin_while_active.get(),
+                self.spin_full_active.get(),
             );
             while !latch.probe() {
                 if let Some(job) = self.find_work() {

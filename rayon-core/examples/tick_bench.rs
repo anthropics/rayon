@@ -6,14 +6,29 @@
 //! adaptive policy can lose: every region ends with the pool idle, so
 //! workers sleep after each region and have to be woken for the next one.
 //!
+//! Two tick shapes are modelled, selected by `BENCH_MODE`:
+//!
+//! - `regions` (default): each parallel region is its own `install`
+//!   from the driving thread, with sequential work between regions done
+//!   outside the pool, so the pool is fully idle between regions.
+//! - `install`: the whole tick is one `install`; the bursts of parallel
+//!   work and the serial stretches between them run on the installing
+//!   worker, so the pool is never idle during the tick and the other
+//!   workers see only "a region in progress with nothing to steal"
+//!   during each stretch. This is the shape of a coordinator's
+//!   reconcile tick as traced in production: ~12 bursts of a few dozen
+//!   microsecond-sized jobs separated by ~200 us serial stretches inside
+//!   one ~3.5 ms install, then ~3 ms outside the pool.
+//!
 //! Configuration is via environment variables (all optional):
 //!
 //! | var                | default   | meaning                                        |
 //! |--------------------|-----------|------------------------------------------------|
 //! | `BENCH_POLICY`     | adaptive  | adaptive \| bounded \| unbounded               |
+//! | `BENCH_MODE`       | regions   | regions \| install (see above)                 |
 //! | `BENCH_THREADS`    | ncpu/2    | pool width                                     |
 //! | `BENCH_TICKS`      | 2000      | number of ticks measured                       |
-//! | `BENCH_REGIONS`    | 8         | parallel regions per tick                      |
+//! | `BENCH_REGIONS`    | 8         | parallel regions (bursts) per tick             |
 //! | `BENCH_LEAVES`     | 64        | leaf tasks per region (split by nested join)   |
 //! | `BENCH_LEAF_US`    | 10        | busy work per leaf task, microseconds          |
 //! | `BENCH_GAP_US`     | 20        | sequential work between regions, microseconds  |
@@ -81,6 +96,12 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 fn main() {
     let policy: String = env_or("BENCH_POLICY", "adaptive".to_string());
+    let mode: String = env_or("BENCH_MODE", "regions".to_string());
+    let install_mode = match mode.as_str() {
+        "regions" => false,
+        "install" => true,
+        other => panic!("BENCH_MODE={other}: expected regions|install"),
+    };
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
@@ -117,15 +138,34 @@ fn main() {
     for _ in 0..ticks {
         next += period;
         let t0 = Instant::now();
-        for (r, lat) in by_index.iter_mut().enumerate() {
-            if r > 0 {
-                busy(gap_us);
+        if install_mode {
+            let lats = pool.install(|| {
+                let mut lats = Vec::with_capacity(regions);
+                for r in 0..regions {
+                    if r > 0 {
+                        busy(gap_us);
+                    }
+                    let r0 = Instant::now();
+                    region(leaves, leaf_us);
+                    lats.push(r0.elapsed().as_secs_f64() * 1e3);
+                }
+                lats
+            });
+            for (lat, ms) in by_index.iter_mut().zip(lats) {
+                region_lat.push(ms);
+                lat.push(ms);
             }
-            let r0 = Instant::now();
-            pool.install(|| region(leaves, leaf_us));
-            let ms = r0.elapsed().as_secs_f64() * 1e3;
-            region_lat.push(ms);
-            lat.push(ms);
+        } else {
+            for (r, lat) in by_index.iter_mut().enumerate() {
+                if r > 0 {
+                    busy(gap_us);
+                }
+                let r0 = Instant::now();
+                pool.install(|| region(leaves, leaf_us));
+                let ms = r0.elapsed().as_secs_f64() * 1e3;
+                region_lat.push(ms);
+                lat.push(ms);
+            }
         }
         tick_lat.push(t0.elapsed().as_secs_f64() * 1e3);
         let now = Instant::now();
@@ -153,7 +193,7 @@ fn main() {
     // Ideal region time with perfect parallelism, for reference.
     let ideal_region_ms = (leaves as f64 * leaf_us as f64 / threads as f64).ceil() / 1e3;
     println!(
-        "policy={policy}\tthreads={threads}\tregions={regions}\tleaves={leaves}\tleaf_us={leaf_us}\tgap_us={gap_us}\ttick_ms={tick_ms}\t\
+        "policy={policy}\tmode={mode}\tthreads={threads}\tregions={regions}\tleaves={leaves}\tleaf_us={leaf_us}\tgap_us={gap_us}\ttick_ms={tick_ms}\t\
          tick_p50_ms={:.3}\ttick_p99_ms={:.3}\tregion_p50_ms={:.3}\tregion_p99_ms={:.3}\tregion_ideal_ms={:.3}\tcpu_cores={:.2}",
         percentile(&tick_lat, 0.5),
         percentile(&tick_lat, 0.99),

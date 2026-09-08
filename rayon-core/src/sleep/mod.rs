@@ -5,7 +5,7 @@ use crate::SpinPolicy;
 use crate::latch::CoreLatch;
 use crate::sync::{Condvar, Mutex};
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,11 +82,19 @@ pub(super) struct IdleState {
     /// episodes. Copied in from the worker at the start of the episode.
     spin_through_idle: bool,
 
-    /// Adaptive policy: whether this worker spins while a region is in
-    /// progress even though it expects long idle gaps, as remembered from
-    /// the previous episode. Copied in from the worker at the start of
-    /// the episode.
-    spin_while_active: bool,
+    /// Adaptive policy: whether this worker spins a full window while a
+    /// region is in progress (beyond the few rounds always allowed), as
+    /// remembered from earlier episodes. Copied in from the worker at
+    /// the start of the episode.
+    spin_full_active: bool,
+
+    /// Adaptive policy: rounds spun with a region in progress in the
+    /// current run of rounds.
+    active_rounds: u32,
+
+    /// Adaptive policy: the current run of rounds spun a whole window
+    /// with a region in progress throughout and found nothing.
+    spun_through_active: bool,
 
     /// Adaptive policy: a spin round observed the pool fully idle.
     saw_idle: bool,
@@ -108,6 +116,10 @@ pub(super) struct IdleState {
     /// work.
     short_sleep: bool,
 
+    /// Adaptive policy: this episode slept, but was woken sooner than a
+    /// spin window lasts -- a serial stretch spinning would have bridged.
+    short_active_sleep: bool,
+
     /// Adaptive policy: the current run of rounds began with a wake from
     /// sleep (so `saw_idle` describes the run after the last sleep).
     woke: bool,
@@ -121,6 +133,12 @@ struct WorkerSleepState {
     is_blocked: Mutex<bool>,
 
     condvar: Condvar,
+
+    /// Adaptive policy: set by a waker acting on newly pushed or injected
+    /// jobs (as opposed to the ramp-up wake a worker issues on finding
+    /// work), read by the sleeper on waking. Written under `is_blocked`'s
+    /// lock before the notify, so the mutex orders it.
+    woken_by_jobs: AtomicBool,
 }
 
 const ROUNDS_UNTIL_SLEEPY: u32 = 32;
@@ -133,6 +151,19 @@ const ROUNDS_UNTIL_SLEEPING: u32 = ROUNDS_UNTIL_SLEEPY + 1;
 /// window stretches (yields deschedule, sweeps contend) and a measured
 /// yardstick would then call ever longer gaps short.
 const SHORT_SLEEP: Duration = Duration::from_micros(200);
+
+/// Adaptive policy: a sleep shorter than this, begun with a region in
+/// progress, counts as a serial stretch a full spin window would have
+/// bridged. Tighter than `SHORT_SLEEP`: the sleep follows the rounds
+/// always spun, and only a stretch shorter than the rest of a window is
+/// worth learning to spin through.
+const SHORT_ACTIVE_SLEEP: Duration = Duration::from_micros(50);
+
+/// Adaptive policy: spin rounds always allowed while a region is in
+/// progress, whatever the worker has learned. A burst of work pushes its
+/// jobs microseconds apart; this many rounds of yield plus steal sweep
+/// span that.
+const ACTIVE_ROUNDS_ALWAYS: u32 = 4;
 
 /// `Instant::now()` where the platform has a clock; `None` on targets
 /// (wasm32-unknown-unknown) where it would panic. Without a clock the
@@ -179,7 +210,7 @@ impl Sleep {
 
     #[inline]
     fn release_searcher(&self, idle_state: &mut IdleState) {
-        if idle_state.is_searcher {
+        if idle_state.is_searcher && self.policy == SpinPolicy::ProducerBounded {
             self.searchers.fetch_sub(1, Ordering::Relaxed);
         }
         idle_state.is_searcher = false;
@@ -208,7 +239,7 @@ impl Sleep {
         worker_index: usize,
         top_level: bool,
         spin_through_idle: bool,
-        spin_while_active: bool,
+        spin_full_active: bool,
     ) -> IdleState {
         self.counters.add_inactive_thread();
         let top_level = top_level && self.policy == SpinPolicy::Adaptive;
@@ -236,12 +267,15 @@ impl Sleep {
             is_searcher,
             top_level,
             spin_through_idle,
-            spin_while_active,
+            spin_full_active,
+            active_rounds: 0,
+            spun_through_active: false,
             saw_idle: false,
             stopped_early: false,
             spun_through_idle: false,
             slept_idle: false,
             short_sleep: false,
+            short_active_sleep: false,
             woke: false,
         }
     }
@@ -255,7 +289,7 @@ impl Sleep {
         // If we were the last idle thread and other threads are still sleeping,
         // then we should wake up another thread.
         let threads_to_wake = self.counters.sub_inactive_thread();
-        self.wake_any_threads(threads_to_wake as u32);
+        self.wake_any_threads(threads_to_wake as u32, false);
     }
 
     #[inline]
@@ -279,14 +313,18 @@ impl Sleep {
                     idle_state.spin_through_idle
                 } else {
                     // A region is in progress and may produce stealable
-                    // work. Spin on if this worker expects more work
-                    // within a window either way, or if its last search
-                    // succeeded without a sleep -- work is flowing to it
-                    // here. A worker that had to sleep for its last job
-                    // does not: on a pool much wider than a region's
-                    // parallelism most workers only ever sweep empty
-                    // deques, slowing the ones doing the work.
-                    idle_state.spin_through_idle || idle_state.spin_while_active
+                    // work. A few rounds are always worth it: the jobs of
+                    // a burst are pushed microseconds apart. The rest of
+                    // the window is worth it only if this worker
+                    // remembers such windows finding work, i.e. the
+                    // serial stretches of the region being shorter than a
+                    // window; otherwise the window is spent sweeping
+                    // deques nothing will refill, slowing the worker that
+                    // is executing.
+                    idle_state.active_rounds += 1;
+                    idle_state.active_rounds <= ACTIVE_ROUNDS_ALWAYS
+                        || idle_state.spin_through_idle
+                        || idle_state.spin_full_active
                 };
                 if !spin {
                     idle_state.stopped_early = true;
@@ -298,8 +336,10 @@ impl Sleep {
             idle_state.rounds += 1;
         } else if idle_state.rounds == ROUNDS_UNTIL_SLEEPY {
             // Record whether this run of rounds spun a whole window
-            // through an idle pool; an early stop lands here too.
+            // through an idle pool, or a whole window with a region in
+            // progress throughout; an early stop lands here too.
             idle_state.spun_through_idle = idle_state.saw_idle && !idle_state.stopped_early;
+            idle_state.spun_through_active = !idle_state.saw_idle && !idle_state.stopped_early;
             idle_state.stopped_early = false;
             idle_state.jobs_counter = self.announce_sleepy();
             idle_state.rounds += 1;
@@ -372,6 +412,7 @@ impl Sleep {
         // Judge each sleep on its own: an episode may sleep more than once.
         idle_state.slept_idle = idle_state.saw_idle;
         idle_state.short_sleep = false;
+        idle_state.short_active_sleep = false;
         let blocked_at = if self.policy == SpinPolicy::Adaptive {
             now()
         } else {
@@ -393,6 +434,7 @@ impl Sleep {
             // Work arrived before we even blocked: as short a sleep as
             // there is.
             idle_state.short_sleep = true;
+            idle_state.short_active_sleep = true;
         } else {
             // If we don't see an injected job (the normal case), then flag
             // ourselves as asleep and wait till we are notified.
@@ -409,8 +451,14 @@ impl Sleep {
             // A sleep shorter than a spin window means the work we were
             // woken for arrived while spinning would still have been
             // searching: the pool was not idle after all.
+            // Only a wake for newly pushed or injected jobs says a burst
+            // arrived; the ramp-up wake a worker issues on finding work
+            // says nothing about when.
+            let by_jobs = sleep_state.woken_by_jobs.load(Ordering::Relaxed);
             if let Some(at) = blocked_at {
-                idle_state.short_sleep = at.elapsed() < SHORT_SLEEP;
+                let slept_for = at.elapsed();
+                idle_state.short_sleep = slept_for < SHORT_SLEEP;
+                idle_state.short_active_sleep = by_jobs && slept_for < SHORT_ACTIVE_SLEEP;
             }
         }
 
@@ -426,6 +474,7 @@ impl Sleep {
                 // (`spun_through_idle`, `slept_idle`, `short_sleep`) is
                 // kept for the verdict once work is found.
                 idle_state.saw_idle = false;
+                idle_state.active_rounds = 0;
                 idle_state.woke = true;
             }
             SpinPolicy::ProducerBounded => {
@@ -443,7 +492,7 @@ impl Sleep {
     /// thread is asleep, though in rare cases it could have been
     /// awoken by (e.g.) new work having been posted.
     pub(super) fn notify_worker_latch_is_set(&self, target_worker_index: usize) {
-        self.wake_specific_thread(target_worker_index);
+        self.wake_specific_thread(target_worker_index, false);
     }
 
     /// Signals that `num_jobs` new jobs were injected into the thread
@@ -509,18 +558,18 @@ impl Sleep {
         // check to see if we have enough idle workers.
         if !queue_was_empty {
             let num_to_wake = Ord::min(num_jobs, num_sleepers);
-            self.wake_any_threads(num_to_wake);
+            self.wake_any_threads(num_to_wake, true);
         } else if num_awake_but_idle < num_jobs {
             let num_to_wake = Ord::min(num_jobs - num_awake_but_idle, num_sleepers);
-            self.wake_any_threads(num_to_wake);
+            self.wake_any_threads(num_to_wake, true);
         }
     }
 
     #[cold]
-    fn wake_any_threads(&self, mut num_to_wake: u32) {
+    fn wake_any_threads(&self, mut num_to_wake: u32, by_jobs: bool) {
         if num_to_wake > 0 {
             for i in 0..self.worker_sleep_states.len() {
-                if self.wake_specific_thread(i) {
+                if self.wake_specific_thread(i, by_jobs) {
                     num_to_wake -= 1;
                     if num_to_wake == 0 {
                         return;
@@ -530,12 +579,13 @@ impl Sleep {
         }
     }
 
-    fn wake_specific_thread(&self, index: usize) -> bool {
+    fn wake_specific_thread(&self, index: usize, by_jobs: bool) -> bool {
         let sleep_state = &self.worker_sleep_states[index];
 
         let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
         if *is_blocked {
             *is_blocked = false;
+            sleep_state.woken_by_jobs.store(by_jobs, Ordering::Relaxed);
             sleep_state.condvar.notify_one();
 
             // When the thread went to sleep, it will have incremented
@@ -567,10 +617,31 @@ impl IdleState {
         self.jobs_counter = JobsEventCounter::DUMMY;
     }
 
-    /// Adaptive policy: whether this episode found its work without
-    /// having to sleep, i.e. work was flowing to this worker.
-    pub(super) fn found_awake(&self) -> bool {
-        !self.slept
+    /// Adaptive policy: what this episode showed about spinning a full
+    /// window while a region is in progress, for the worker to remember.
+    pub(super) fn active_window(&self) -> Verdict {
+        if !self.slept || self.woke {
+            // The last run of rounds ended by finding work.
+            if !self.saw_idle && self.active_rounds > ACTIVE_ROUNDS_ALWAYS {
+                // Found by spinning past the always-allowed rounds with a
+                // region in progress: a serial stretch shorter than a
+                // window was bridged.
+                return Verdict::Hit;
+            }
+            if !self.slept {
+                return Verdict::Unknown;
+            }
+        }
+        if self.short_active_sleep && !self.slept_idle {
+            // Went to sleep with a region in progress, and its next burst
+            // arrived within a window: spinning might have caught it.
+            Verdict::Short
+        } else if self.spun_through_active {
+            // A whole window with a region in progress found nothing.
+            Verdict::Miss
+        } else {
+            Verdict::Unknown
+        }
     }
 
     /// Adaptive policy: what this episode showed about spinning through
@@ -590,10 +661,10 @@ impl IdleState {
         }
         if self.short_sleep && self.slept_idle {
             // Slept with the pool idle, but work arrived within a window:
-            // spinning would have found it. (A short sleep while a region
+            // spinning might have found it. (A short sleep while a region
             // was in progress is churn within it and says nothing about
             // the gaps between regions.)
-            Verdict::Hit
+            Verdict::Short
         } else if self.spun_through_idle {
             // Spun a whole window through an idle pool for nothing.
             Verdict::Miss
@@ -609,8 +680,11 @@ impl IdleState {
 /// through an idle pool would find work within a spin window.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
-    /// Spinning found work, or would have.
+    /// Spinning found work.
     Hit,
+    /// A sleep was cut short by work arriving within a window: spinning
+    /// might have found it -- or another worker might have got it.
+    Short,
     /// A full spin window found nothing.
     Miss,
     /// The episode did not test it.

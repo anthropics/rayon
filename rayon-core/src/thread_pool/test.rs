@@ -450,12 +450,14 @@ fn spin_policy_pools_work() {
 
 #[test]
 fn spin_policies_tick_shaped_workload() {
-    // A control loop's shape: several short parallel regions back to
+    // A control loop's shapes: several short parallel regions back to
     // back with sequential work between them, then an idle gap before the
-    // next tick. This walks the adaptive policy through every transition
-    // it learns from (spinning through a short gap, stopping at a long
-    // one, waking from both) and must stay live and correct under all
-    // three policies.
+    // next tick -- once with each region its own install, once with the
+    // whole tick inside one install (see the tick_bench example). This
+    // walks the adaptive policy through every transition it learns from
+    // (spinning through a short gap, stopping at a long one, spinning or
+    // sleeping through a serial stretch, waking from each) and must stay
+    // live and correct under all three policies.
     fn region(n: u64) -> u64 {
         if n <= 1 {
             // A few microseconds of work per leaf.
@@ -485,12 +487,29 @@ fn spin_policies_tick_shaped_workload() {
     ];
     for (i, builder) in builders.into_iter().enumerate() {
         let pool = builder.build().unwrap();
-        for _tick in 0..40 {
-            for r in 0..8 {
-                if r > 0 {
-                    busy(20);
+        for tick in 0..80 {
+            if tick % 2 == 0 {
+                // Each region its own install: the pool goes idle between.
+                for r in 0..8 {
+                    if r > 0 {
+                        busy(20);
+                    }
+                    assert_eq!(pool.install(|| region(64)), 64);
                 }
-                assert_eq!(pool.install(|| region(64)), 64);
+            } else {
+                // The whole tick one install: bursts separated by serial
+                // stretches on the installing worker, the pool never idle.
+                let sum = pool.install(|| {
+                    let mut sum = 0;
+                    for r in 0..8 {
+                        if r > 0 {
+                            busy(20);
+                        }
+                        sum += region(16);
+                    }
+                    sum
+                });
+                assert_eq!(sum, 128);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
